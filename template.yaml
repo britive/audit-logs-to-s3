@@ -1,0 +1,582 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  Tenant:
+    Type: String
+    Description: Britive tenant (example.britive-app.com would be a tenant of example)
+  CreateSplunkResources:
+    Type: String
+    Default: 'False'
+    Description: Should resources related to Splunk be created (iam user with inline policy, sqs queue with sns subscription)?
+    AllowedValues:
+      - 'False'
+      - 'True'
+  SplunkIamUserName:
+    Type: String
+    Description: The name of the IAM user used by Splunk to connect to S3/SQS. If no provided an IAM user will be created. Otherwise an inline policy will be added to the existing IAM user.
+    Default: ''
+  DeleteLogsBucketObjectsOnStackDeletion:
+    Type: String
+    Default: 'False'
+    AllowedValues:
+      - 'False'
+      - 'True'
+  NumberDaysOfHistoryToPull:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 30
+    Description: The number of days of history to pull on the initial audit logs pull.
+  RetrievalInterval:
+    Type: Number
+    Default: 60
+    MinValue: 15
+    Description: The number of minutes between retrieving the audit logs.
+  CreateAthenaResources:
+    Type: String
+    Default: 'True'
+    AllowedValues:
+      - 'False'
+      - 'True'
+Conditions:
+  ShouldDeleteLogsBucketObjectsOnStackDeletion: !Equals [!Ref DeleteLogsBucketObjectsOnStackDeletion, 'True']
+  ShouldCreateSplunkResources: !Equals [!Ref CreateSplunkResources, 'True']
+  ShouldCreateSplunkIamUser: !And [!Equals [!Ref SplunkIamUserName, ''], Condition: ShouldCreateSplunkResources]
+  ShouldCreateAthenaResources: !Equals [!Ref CreateAthenaResources, 'True']
+  ShouldCreateCustomResourcesLambda: !Or [Condition: ShouldDeleteLogsBucketObjectsOnStackDeletion, Condition: ShouldCreateAthenaResources]
+Resources:
+  # Lambda Layers
+  LayerBritive:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: ./lambda-layers/britive
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.9
+  LayerRequests:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: ./lambda-layers/requests
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.9
+  LayerJsonLines:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: ./lambda-layers/jsonlines
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.9
+  LayerCrHelper:
+    Type: AWS::Serverless::LayerVersion
+    Condition: ShouldCreateCustomResourcesLambda
+    Properties:
+      ContentUri: ./lambda-layers/crhelper
+      CompatibleRuntimes:
+        - python3.8
+        - python3.7
+        - python3.9
+
+  # KMS Keys
+  Key:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'key used for all resources in stack ${AWS::StackName}'
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: kms:*
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service:
+                - s3.amazonaws.com
+                - !If [ShouldCreateSplunkResources, sqs.amazonaws.com, !Ref AWS::NoValue]
+                - sns.amazonaws.com
+                - cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+          - Effect: Allow # from https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/encrypt-log-data-kms.html
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*'
+      PendingWindowInDays: 7
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/britive-audit-logs
+      TargetKeyId: !Ref Key
+
+  # Secrets
+  BritiveAuditLogsApiToken:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Holds the API token for the Britive tenant
+      KmsKeyId: !Ref Key
+
+  # SNS Topics
+  TopicLogs:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref Key
+  TopicLogsNotificationPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref TopicLogs
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${AWS::StackName}-bucketlogs-*'  # errors when creating the S3 notification events due to the policy not existing yet and getting S3 bucket creation error of "unable to validate the following destination configuration"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Topics:
+        - !Ref TopicLogs
+
+  # SQS Queues
+  QueueLogsDeadLetter:
+    Type: AWS::SQS::Queue
+    Condition: ShouldCreateSplunkResources
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 3600 # 1 hour
+      KmsMasterKeyId: !Ref Key
+  QueueLogs:
+    Type: AWS::SQS::Queue
+    Condition: ShouldCreateSplunkResources
+    Properties:
+      KmsDataKeyReusePeriodSeconds: 3600 # 1 hour
+      KmsMasterKeyId: !Ref Key
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt QueueLogsDeadLetter.Arn
+        maxReceiveCount: 10
+      VisibilityTimeout: 120
+  QueueLogsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Condition: ShouldCreateSplunkResources
+    Properties:
+      Queues:
+        - !Ref QueueLogs
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: sns.amazonaws.com
+          Action: sqs:SendMessage
+          Resource: !GetAtt QueueLogs.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn: !Ref TopicLogs
+
+  # SNS Topic Subscriptions
+  SubscriptionLogs:
+    Type: AWS::SNS::Subscription
+    Condition: ShouldCreateSplunkResources
+    Properties:
+      Endpoint: !GetAtt QueueLogs.Arn
+      Protocol: sqs
+      TopicArn: !Ref TopicLogs
+
+  # S3 Buckets
+  BucketLogs:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - TopicLogsNotificationPolicy
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref Key
+              SSEAlgorithm: aws:kms
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: logs/
+                  - Name: suffix
+                    Value: gz
+            Topic: !Ref TopicLogs
+      OwnershipControls: # this actually exists but cfn-lint has not been updated as of 2021-12-13 to support the property
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  BucketAthenaQueryResults:
+    Type: AWS::S3::Bucket
+    Condition: ShouldCreateAthenaResources
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Ref Key
+              SSEAlgorithm: aws:kms
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: 2 # let's have AWS automatically remove the objects  after 2 days = this will keep costs lower
+            Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  BucketLogsObjectNuker:
+    Type: Custom::S3ObjectNuker
+    Condition: ShouldDeleteLogsBucketObjectsOnStackDeletion
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      BucketName: !Ref BucketLogs
+  BucketAthenaQueryResultsObjectNuker:
+    Type: Custom::S3ObjectNuker
+    Condition: ShouldCreateAthenaResources
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      BucketName: !Ref BucketAthenaQueryResults
+
+  # Athena
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Condition: ShouldCreateAthenaResources
+    Properties:
+      Description: britive audit logs
+      Name: !Ref AWS::StackName
+      RecursiveDeleteOption: true
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        RequesterPaysEnabled: false
+        ResultConfiguration:
+          EncryptionConfiguration:
+            EncryptionOption: SSE_KMS
+            KmsKey: !Ref Key
+          OutputLocation: !Sub 's3://${BucketAthenaQueryResults}/'
+  AthenaDatabase:
+    Type: Custom::AthenaDatabase
+    Condition: ShouldCreateAthenaResources
+    DependsOn:
+      - BucketAthenaQueryResultsObjectNuker
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      Catalog: AwsDataCatalog
+      Database: !Ref AWS::StackName
+      Workgroup: !Ref AthenaWorkgroup
+  AthenaAuditLogsTable:
+    Type: Custom::AthenaTable
+    Condition: ShouldCreateAthenaResources
+    DependsOn: AthenaDatabase
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      Catalog: AwsDataCatalog
+      Database: !Ref AWS::StackName
+      Workgroup: !Ref AthenaWorkgroup
+      TableName: raw_audit_logs
+      TableDefinition: !Sub |
+        CREATE EXTERNAL TABLE `raw_audit_logs`(
+          `timestamp` timestamp,
+          `timestamp_original` string,
+          `id` string,
+          `actor` struct<
+        		`userid`: string,
+        		`displayname`:string,
+        		`type`:string,
+        		`role`:string,
+        		`username`:string,
+        		`credential`:struct<
+        			`id`:string,
+        			`name`:string,
+        			`type`:string
+        		>,
+                `additionalinfo`:string
+        	>,
+        	`client` struct<
+        		`device`:string,
+        		`ipaddress`:string,
+        		`useragent`:string,
+        		`displayname`:string,
+        		`browser`:string,
+        		`platform`:string,
+        		`additionalinfo`:string
+        	>,
+        	`event` struct<
+        		`eventtype`:string,
+        		`displayname`:string,
+        		`additionalinfo`:string
+        	>,
+        	`target` struct<
+        		`targetid`:string,
+        		`displayname`:string,
+        		`applicationname`:string,
+        		`environmentname`:string,
+        		`environmentgroupname`:string,
+        		`applicationsessionid`:string,
+        		`additionalinfo`:string
+
+        	>,
+        	`result` struct<
+        		`success`:boolean,
+        		`message`:string
+        	>,
+        	`tenantid` string
+        )
+        ROW FORMAT SERDE
+          'org.openx.data.jsonserde.JsonSerDe'
+        STORED AS INPUTFORMAT
+          'org.apache.hadoop.mapred.TextInputFormat'
+        OUTPUTFORMAT
+          'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat'
+        LOCATION
+          's3://${BucketLogs}/logs'
+  AthenaAuditLogsView:
+    Type: Custom::AthenaView
+    Condition: ShouldCreateAthenaResources
+    DependsOn: AthenaAuditLogsTable
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      Catalog: AwsDataCatalog
+      Database: !Ref AWS::StackName
+      Workgroup: !Ref AthenaWorkgroup
+      ViewName: audit_logs
+      ViewDefinition: !Sub |
+        CREATE OR REPLACE VIEW audit_logs as
+        select
+          id,
+          timestamp,
+          actor.userid as actor_userid,
+          actor.displayname as actor_displayname,
+          actor.type as actor_type,
+          actor.role as actor_role,
+          actor.username as actor_username,
+          actor.credential.id as actor_credential_id,
+          actor.credential.name as actor_credential_name,
+          actor.credential.type as actor_credential_type,
+          cast(json_parse(actor.additionalinfo) as map<varchar, varchar>) as actor_additionalinfo,
+          client.device as client_device,
+          client.ipaddress as client_ipaddress,
+          client.useragent as client_useragent,
+          client.displayname as client_displayname,
+          client.browser as client_browser,
+          client.platform as client_platform,
+          cast(json_parse(client.additionalinfo) as map<varchar, varchar>) as client_additionalinfo,
+          event.eventtype as event_eventype,
+          event.displayname as event_displayname,
+          cast(json_parse(event.additionalinfo) as map<varchar, varchar>) as event_additionalinfo,
+          target.targetid as target_targetid,
+          target.displayname as target_displayname,
+          target.applicationname as target_applicationname,
+          target.environmentname as target_environmentname,
+          target.environmentgroupname as target_environmentgroupname,
+          target.applicationsessionid as target_applicationsessionid,
+          cast(json_parse(target.additionalinfo) as map<varchar, varchar>) as target_additionalinfo,
+          result.success as result_success,
+          result.message as result_message,
+          tenantid
+        from
+          ${AthenaAuditLogsTable.TableName}
+
+
+
+  # Lambda Functions
+  LambdaCollectLogs:
+    Type: AWS::Serverless::Function
+    Properties:
+      AutoPublishAlias: prod
+      CodeUri: ./lambda/audit-logs-etl
+      Description: invoked via scheduled event to pull down Britive audit logs to S3
+      Environment:
+        Variables:
+          bucket: !Ref BucketLogs
+          tenant: !Ref Tenant
+          secret: !Ref BritiveAuditLogsApiToken
+          history_days: !Ref NumberDaysOfHistoryToPull
+      Events:
+        ScheduledEvent:
+          Type: Schedule
+          Properties:
+            Enabled: true
+            Schedule: !Sub 'rate(${RetrievalInterval} minutes)'
+      Handler: app.handler
+      Layers:
+        - !Ref LayerBritive
+        - !Ref LayerJsonLines
+        - !Ref LayerRequests
+      MemorySize: 1024
+      Policies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Resource: !Sub '${BucketLogs.Arn}/*'
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub '${BucketLogs.Arn}/config/*'
+          - Effect: Allow
+            Action:
+              - s3:ListBucket # Note: s3:ListBucket is the name of the permission that allows a user to list the objects in a bucket. ListObjectsV2 is the name of the API call that lists the objects in a bucket. Dumb for sure.
+            Resource: !GetAtt BucketLogs.Arn
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt Key.Arn
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Ref BritiveAuditLogsApiToken
+      ReservedConcurrentExecutions: 1  # only allow 1 invocation of this function to run at a time so we don't have any race conditions
+      Runtime: python3.9
+      Timeout: 600 # 10 minutes
+  LambdaCustomResources:
+    Type: AWS::Serverless::Function
+    Condition: ShouldCreateCustomResourcesLambda
+    DependsOn: LogGroupLambdaCustomResources
+    Properties:
+      AutoPublishAlias: prod
+      CodeUri: ./lambda/custom-resources
+      Description: custom cloudformation resources
+      FunctionName: !Sub '${AWS::StackName}-custom-resources'  # hardcoded name so we can associate the lambda function and log group
+      Handler: index.handler
+      Layers:
+        - !Ref LayerCrHelper
+      MemorySize: 512
+      Policies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt Key.Arn
+          - Effect: Allow
+            Action:  # have I said recently how much I just LOVE athena/glue permissions? ugh
+              - athena:GetDatabase
+              - athena:ListTableMetadata
+              - glue:GetDatabase
+              - glue:GetTables
+              - glue:CreateDatabase
+              - glue:GetTable
+              - glue:CreateTable
+              - glue:GetDatabases
+              - glue:DeleteDatabase
+              - glue:GetPartitions
+              - glue:GetPartition
+              - glue:DeletePartition
+              - glue:DeleteTable
+              - glue:UpdateTable
+            Resource:
+              - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}/*'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/${AWS::StackName}/*'
+          - Effect: Allow # for athena
+            Action:
+              - athena:StartQueryExecution
+              - athena:GetQueryExecution
+            Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkgroup}'
+          - Effect: Allow  # for athena
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:AbortMultipartUpload
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:List*
+              - s3:DeleteObject
+            Resource:
+              - !GetAtt BucketAthenaQueryResults.Arn
+              - !Sub '${BucketAthenaQueryResults.Arn}/*'
+          - Effect: Allow  # for logs bucket s3 object nuker
+            Action:
+              - s3:List*
+              - s3:DeleteObject
+            Resource:
+              - !GetAtt BucketLogs.Arn
+              - !Sub '${BucketLogs.Arn}/*'
+      ReservedConcurrentExecutions: 3
+      Runtime: python3.9
+      Timeout: 900 # 15 minutes
+
+  # CloudWatch Log Groups
+  LogGroupLambdaCollectLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt Key.Arn
+      LogGroupName: !Sub '/aws/lambda/${LambdaCollectLogs}'
+      RetentionInDays: 14
+  LogGroupLambdaCustomResources:  # hardcoded name so we can associate the lambda function and log group
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldCreateCustomResourcesLambda
+    Properties:
+      KmsKeyId: !GetAtt Key.Arn
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-custom-resources'
+
+  # Splunk IAM Resources
+  SplunkUser: # up to the end user to establish API keys
+    Type: AWS::IAM::User
+    Condition: ShouldCreateSplunkIamUser
+  SplunkPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ShouldCreateSplunkResources
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub '${BucketLogs.Arn}/logs/*'
+          - Effect: Allow
+            Action: kms:Decrypt
+            Resource: !GetAtt Key.Arn
+          - Effect: Allow
+            Action: sqs:ListQueues
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - sqs:DeleteMessage
+              - sqs:GetQueueUrl
+              - sqs:ReceiveMessage
+              - sqs:SendMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt QueueLogs.Arn
+      PolicyName: britive-audit-logs
+      Users:
+        - !If [ShouldCreateSplunkIamUser, !Ref SplunkUser, !Ref SplunkIamUserName]
