@@ -13,7 +13,8 @@ valid_resource_types = [
     'Custom::AthenaTable',
     'Custom::AthenaView',
     'Custom::S3ObjectNuker',
-    'Custom::StringFunctions'
+    'Custom::StringFunctions',
+    'Custom::Wait'
 ]
 
 
@@ -30,6 +31,9 @@ def create(event, context):
         return s3_object_nuker.create(helper, event)
     if resource_type == 'Custom::StringFunctions':
         return string_functions.create(helper, event)
+    if resource_type == 'Custom::Wait':
+        return string_functions.create(helper, event)
+
 
 @helper.update
 def update(event, context):
@@ -43,6 +47,8 @@ def update(event, context):
     if resource_type == 'Custom::S3ObjectNuker':
         return s3_object_nuker.update(helper, event)
     if resource_type == 'Custom::StringFunctions':
+        return string_functions.update(helper, event)
+    if resource_type == 'Custom::Wait':
         return string_functions.update(helper, event)
 
 
@@ -58,6 +64,8 @@ def delete(event, context):
     if resource_type == 'Custom::S3ObjectNuker':
         return s3_object_nuker.delete(helper, event)
     if resource_type == 'Custom::StringFunctions':
+        return string_functions.delete(helper, event)
+    if resource_type == 'Custom::Wait':
         return string_functions.delete(helper, event)
 
 

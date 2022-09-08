@@ -1,5 +1,4 @@
 
-# no op
 def create(helper, event):
     value = str(event['ResourceProperties']['InputString'])
     helper.Data.update({'Strip': value.strip()})
@@ -10,7 +9,6 @@ def create(helper, event):
     helper.Data.update({'SwapCase': value.swapcase()})
 
 
-# no op
 def update(helper, event):
     create(helper, event)
 
