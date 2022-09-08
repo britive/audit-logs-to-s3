@@ -280,7 +280,7 @@ Resources:
     Condition: ShouldCreateAthenaResources
     Properties:
       Description: britive audit logs
-      Name: !Ref AWS::StackName
+      Name: !GetAtt StackNameStringFunctions.Lowercase
       RecursiveDeleteOption: true
       State: ENABLED
       WorkGroupConfiguration:
@@ -297,10 +297,11 @@ Resources:
     Condition: ShouldCreateAthenaResources
     DependsOn:
       - BucketAthenaQueryResultsObjectNuker
+      - LambdaCustomResourcesAthenaPolicy
     Properties:
       ServiceToken: !Ref LambdaCustomResources.Alias
       Catalog: AwsDataCatalog
-      Database: !Ref AWS::StackName
+      Database: !GetAtt StackNameStringFunctions.Lowercase
       Workgroup: !Ref AthenaWorkgroup
   AthenaAuditLogsTable:
     Type: Custom::AthenaTable
@@ -309,7 +310,7 @@ Resources:
     Properties:
       ServiceToken: !Ref LambdaCustomResources.Alias
       Catalog: AwsDataCatalog
-      Database: !Ref AWS::StackName
+      Database: !GetAtt StackNameStringFunctions.Lowercase
       Workgroup: !Ref AthenaWorkgroup
       TableName: raw_audit_logs
       TableDefinition: !Sub |
@@ -375,7 +376,7 @@ Resources:
     Properties:
       ServiceToken: !Ref LambdaCustomResources.Alias
       Catalog: AwsDataCatalog
-      Database: !Ref AWS::StackName
+      Database: !GetAtt StackNameStringFunctions.Lowercase
       Workgroup: !Ref AthenaWorkgroup
       ViewName: audit_logs
       ViewDefinition: !Sub |
@@ -471,7 +472,8 @@ Resources:
       Timeout: 600 # 10 minutes
   LambdaCustomResources:
     Type: AWS::Serverless::Function
-    DependsOn: LogGroupLambdaCustomResources
+    DependsOn:
+       - LogGroupLambdaCustomResources
     Properties:
       AutoPublishAlias: prod
       CodeUri: ./lambda/custom-resources
@@ -534,10 +536,10 @@ Resources:
             Resource:
               - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/AwsDataCatalog'
               - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
-              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AWS::StackName}'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${StackNameStringFunctions.Lowercase}'
               - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/default'
-              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AWS::StackName}/*'
-              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/${AWS::StackName}/*'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${StackNameStringFunctions.Lowercase}/*'
+              - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/${StackNameStringFunctions.Lowercase}/*'
           - Effect: Allow # for athena
             Action:
               - athena:StartQueryExecution
