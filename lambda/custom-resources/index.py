@@ -3,6 +3,7 @@ import athena_database
 import athena_table
 import athena_view
 import s3_object_nuker
+import string_functions
 import json
 
 helper = CfnResource(sleep_on_delete=60)
@@ -11,7 +12,8 @@ valid_resource_types = [
     'Custom::AthenaDatabase',
     'Custom::AthenaTable',
     'Custom::AthenaView',
-    'Custom::S3ObjectNuker'
+    'Custom::S3ObjectNuker',
+    'Custom::StringFunctions'
 ]
 
 
@@ -26,7 +28,8 @@ def create(event, context):
         return athena_view.create(helper, event)
     if resource_type == 'Custom::S3ObjectNuker':
         return s3_object_nuker.create(helper, event)
-
+    if resource_type == 'Custom::StringFunctions':
+        return string_functions.create(helper, event)
 
 @helper.update
 def update(event, context):
@@ -39,6 +42,8 @@ def update(event, context):
         return athena_view.update(helper, event)
     if resource_type == 'Custom::S3ObjectNuker':
         return s3_object_nuker.update(helper, event)
+    if resource_type == 'Custom::StringFunctions':
+        return string_functions.update(helper, event)
 
 
 @helper.delete
@@ -52,6 +57,8 @@ def delete(event, context):
         return athena_view.delete(helper, event)
     if resource_type == 'Custom::S3ObjectNuker':
         return s3_object_nuker.delete(helper, event)
+    if resource_type == 'Custom::StringFunctions':
+        return string_functions.delete(helper, event)
 
 
 def handler(event, context):

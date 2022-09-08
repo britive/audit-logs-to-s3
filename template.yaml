@@ -43,7 +43,6 @@ Conditions:
   ShouldCreateSplunkResources: !Equals [!Ref CreateSplunkResources, 'True']
   ShouldCreateSplunkIamUser: !And [!Equals [!Ref SplunkIamUserName, ''], Condition: ShouldCreateSplunkResources]
   ShouldCreateAthenaResources: !Equals [!Ref CreateAthenaResources, 'True']
-  ShouldCreateCustomResourcesLambda: !Or [Condition: ShouldDeleteLogsBucketObjectsOnStackDeletion, Condition: ShouldCreateAthenaResources]
 Resources:
   # Lambda Layers
   LayerBritive:
@@ -72,7 +71,6 @@ Resources:
         - python3.9
   LayerCrHelper:
     Type: AWS::Serverless::LayerVersion
-    Condition: ShouldCreateCustomResourcesLambda
     Properties:
       ContentUri: ./lambda-layers/crhelper
       CompatibleRuntimes:
@@ -134,6 +132,14 @@ Resources:
       Description: Holds the API token for the Britive tenant
       KmsKeyId: !Ref Key
 
+
+  # String Functions (custom resource to get lowercase stack name in this case)
+  StackNameStringFunctions:
+    Type: Custom::StringFunctions
+    Properties:
+      ServiceToken: !Ref LambdaCustomResources.Alias
+      InputString: !Ref AWS::StackName
+
   # SNS Topics
   TopicLogs:
     Type: AWS::SNS::Topic
@@ -152,7 +158,7 @@ Resources:
             Resource: !Ref TopicLogs
             Condition:
               ArnLike:
-                aws:SourceArn: !Sub 'arn:aws:s3:::${AWS::StackName}-bucketlogs-*'  # errors when creating the S3 notification events due to the policy not existing yet and getting S3 bucket creation error of "unable to validate the following destination configuration"
+                aws:SourceArn: !Sub 'arn:aws:s3:::${StackNameStringFunctions.Lowercase}-bucketlogs-*'  # hardcoding due to errors when creating the S3 notification events due to the policy not existing yet and getting S3 bucket creation error of "unable to validate the following destination configuration"
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
       Topics:
@@ -465,7 +471,6 @@ Resources:
       Timeout: 600 # 10 minutes
   LambdaCustomResources:
     Type: AWS::Serverless::Function
-    Condition: ShouldCreateCustomResourcesLambda
     DependsOn: LogGroupLambdaCustomResources
     Properties:
       AutoPublishAlias: prod
@@ -476,7 +481,33 @@ Resources:
       Layers:
         - !Ref LayerCrHelper
       MemorySize: 512
-      Policies:
+      ReservedConcurrentExecutions: 3
+      Runtime: python3.9
+      Timeout: 900 # 15 minutes
+
+  LambdaCustomResourcesLogsNukerPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ShouldDeleteLogsBucketObjectsOnStackDeletion
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:List*
+              - s3:DeleteObject
+            Resource:
+              - !GetAtt BucketLogs.Arn
+              - !Sub '${BucketLogs.Arn}/*'
+      PolicyName: logs-bucket-nuker
+      Roles:
+        - !Ref LambdaCustomResourcesRole
+
+  LambdaCustomResourcesAthenaPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ShouldCreateAthenaResources
+    Properties:
+      PolicyDocument:
         Version: 2012-10-17
         Statement:
           - Effect: Allow
@@ -524,16 +555,10 @@ Resources:
             Resource:
               - !GetAtt BucketAthenaQueryResults.Arn
               - !Sub '${BucketAthenaQueryResults.Arn}/*'
-          - Effect: Allow  # for logs bucket s3 object nuker
-            Action:
-              - s3:List*
-              - s3:DeleteObject
-            Resource:
-              - !GetAtt BucketLogs.Arn
-              - !Sub '${BucketLogs.Arn}/*'
-      ReservedConcurrentExecutions: 3
-      Runtime: python3.9
-      Timeout: 900 # 15 minutes
+      PolicyName: athena-custom-resource
+      Roles:
+        - !Ref LambdaCustomResourcesRole
+
 
   # CloudWatch Log Groups
   LogGroupLambdaCollectLogs:
@@ -544,7 +569,6 @@ Resources:
       RetentionInDays: 14
   LogGroupLambdaCustomResources:  # hardcoded name so we can associate the lambda function and log group
     Type: AWS::Logs::LogGroup
-    Condition: ShouldCreateCustomResourcesLambda
     Properties:
       KmsKeyId: !GetAtt Key.Arn
       LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-custom-resources'
