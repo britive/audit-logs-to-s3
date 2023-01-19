@@ -10,8 +10,7 @@ We will use `python3.9` for this. Install python for your OS.
 ~~~
 
 mkvirtualenv britive-audit-logs # or whatever virtual environment manager you use
-pip install https://github.com/britive/python-sdk/releases/download/v2.7.1/britive-2.7.1.tar.gz
-pip install requests
+pip install britive
 ~~~
 
 ## SAM CLI Install
