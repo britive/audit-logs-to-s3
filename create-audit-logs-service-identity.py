@@ -8,7 +8,7 @@ b = Britive()  # source tenant and token from env vars
 
 # name of the service identity (and associated policy)
 # change as required
-name = 'audit-logs-to-s3-reader8'
+name = 'audit-logs-to-s3-reader101'
 
 policy = {
     "name": name,
@@ -43,7 +43,7 @@ def process():
 
     # no SDK action for this yet so just hard coding it for now
     b.post(
-        url=f'https://{b.tenant}.britive-app.com/api/v1/policy-admin/policies',
+        url=f'https://{b.tenant}/api/v1/policy-admin/policies',
         json=policy
     )
 
