@@ -53,14 +53,8 @@ Resources:
         - python3.8
         - python3.7
         - python3.9
-  LayerRequests:
-    Type: AWS::Serverless::LayerVersion
-    Properties:
-      ContentUri: ./lambda-layers/requests
-      CompatibleRuntimes:
-        - python3.8
-        - python3.7
-        - python3.9
+        - python3.10
+        - python3.11
   LayerJsonLines:
     Type: AWS::Serverless::LayerVersion
     Properties:
@@ -69,6 +63,8 @@ Resources:
         - python3.8
         - python3.7
         - python3.9
+        - python3.10
+        - python3.11
   LayerCrHelper:
     Type: AWS::Serverless::LayerVersion
     Properties:
@@ -77,6 +73,8 @@ Resources:
         - python3.8
         - python3.7
         - python3.9
+        - python3.10
+        - python3.11
 
   # KMS Keys
   Key:
@@ -409,13 +407,11 @@ Resources:
           target.environmentname as target_environmentname,
           target.environmentgroupname as target_environmentgroupname,
           target.applicationsessionid as target_applicationsessionid,
-          cast(json_parse(target.additionalinfo) as map<varchar, varchar>) as target_additionalinfo,
           result.success as result_success,
           result.message as result_message,
           tenantid
         from
           ${AthenaAuditLogsTable.TableName}
-
 
 
   # Lambda Functions
@@ -441,7 +437,6 @@ Resources:
       Layers:
         - !Ref LayerBritive
         - !Ref LayerJsonLines
-        - !Ref LayerRequests
       MemorySize: 1024
       Policies:
         Version: 2012-10-17
@@ -468,7 +463,7 @@ Resources:
             Action: secretsmanager:GetSecretValue
             Resource: !Ref BritiveAuditLogsApiToken
       ReservedConcurrentExecutions: 1  # only allow 1 invocation of this function to run at a time so we don't have any race conditions
-      Runtime: python3.9
+      Runtime: python3.11
       Timeout: 600 # 10 minutes
   LambdaCustomResources:
     Type: AWS::Serverless::Function
@@ -484,7 +479,7 @@ Resources:
         - !Ref LayerCrHelper
       MemorySize: 512
       ReservedConcurrentExecutions: 3
-      Runtime: python3.9
+      Runtime: python3.11
       Timeout: 900 # 15 minutes
 
   LambdaCustomResourcesLogsNukerPolicy:
@@ -560,7 +555,6 @@ Resources:
       PolicyName: athena-custom-resource
       Roles:
         - !Ref LambdaCustomResourcesRole
-
 
   # CloudWatch Log Groups
   LogGroupLambdaCollectLogs:

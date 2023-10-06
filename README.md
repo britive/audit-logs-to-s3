@@ -3,15 +3,6 @@
 This repo holds a sample AWS Serverless Application Model (SAM) template and associated resources which deploys
 infrastructure to regularly query a Britive tenant's audit logs and store the results in S3 for further downstream processing.
 
-## Python Environment Setup
-
-We will use `python3.9` for this. Install python for your OS.
-
-~~~
-
-mkvirtualenv britive-audit-logs # or whatever virtual environment manager you use
-pip install britive
-~~~
 
 ## SAM CLI Install
 
@@ -21,20 +12,6 @@ Install the AWS SAM CLI tooling: https://docs.aws.amazon.com/serverless-applicat
 ## Britive Tenant Resources
 
 First we need to create a service identity and associate a policy that allows access to read audit logs.
-
-Reference the documentation at https://github.com/britive/python-sdk for details on how to use the Python SDK.
-
-~~~
-export BRITIVE_API_TOKEN=...
-export BRITIVE_TENANT=...
-
-python create-audit-logs-service-identity.py
-~~~
-
-This will create a service identity and api token and ensure it has read permissions on the audit logs.
-Note the token as this will be required later.
-
-If manual steps are preferred...
 
 1. Admin > User Administration > Service Identities >  Create new service identity and token (note the token for later)
 2. Admin > Role & Policy Management > Policies > Add Policy > under members select the newly created service identity and under roles choose AuditLogViewRole then save
@@ -46,7 +23,7 @@ Deploy the template via SAM. You will need credentials with sufficient access to
 ~~~
 sam deploy --guided
 ~~~
-This will walk through all of the parameters and other questions. They are listed below for clarity.
+This will walk through all the parameters and other questions. They are listed below for clarity.
 
 ~~~
 Configuring SAM deploy
@@ -83,7 +60,7 @@ sam deploy
 Once done, let's set 2 variables that will be used by the remaining commands.
 
 ~~~
-token=<source from above python script output>
+token=<source from above manual creation>
 stack=<name of deployed stack>
 ~~~
 
@@ -118,7 +95,7 @@ If the Lambda layer packages ever need to be refreshed run the following command
 
 ~~~
 rm -rf ./lambda-layers/britive/python/*
-pip install https://github.com/britive/python-sdk/releases/download/v2.7.1/britive-2.7.1.tar.gz -t ./lambda-layers/britive/python/
+pip install britive -t ./lambda-layers/britive/python/
 
 rm -rf ./lambda-layers/requests/python/*
 pip install requests -t ./lambda-layers/requests/python/
