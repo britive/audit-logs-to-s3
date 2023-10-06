@@ -5,9 +5,8 @@ from . import exceptions
 
 class MySecrets:
     """
-    This class is meant to be called by end users (as part of custom API integration work or the yet to be built
-    Python based Britive CLI tooling). It is an API layer on top of the actions that can be performed on the
-    "My Secrets" page of the Britive UI.
+    This class is meant to be called by end users (as part of custom API integration work or pybritive CLI).
+    It is an API layer on top of the actions that can be performed on the "My Secrets" page of the Britive UI.
 
     No "administrative" access is required by the methods in this class. Each method will only return resources/allow
     actions which are permitted to be performed by the user/service identity, as identified by an API token or
@@ -68,6 +67,7 @@ class MySecrets:
         :raises ApprovalRequiredButNoJustificationProvided: if approval is required but no justification is provided.
         :raises AccessDenied: if the caller does not have access to the secret being requested.
         :raises ApprovalWorkflowTimedOut: if max_wait_time has been reached while waiting for approval.
+        :raises ApprovalWorkflowRejected: if the request to view the secret was rejected.
         """
 
         vault_id = self.__get_vault_id()
@@ -78,7 +78,7 @@ class MySecrets:
         data = {
             'justification': justification
         }
-
+        first = True
         while True:  # this is not loop forever due to exceptions raised or returning the secret value
             try:
                 # handle when the time has expired waiting for approval
@@ -89,15 +89,19 @@ class MySecrets:
                 return self.britive.post(
                     f'{self.base_url}/vault/{vault_id}/accesssecrets',
                     params=params,
-                    json=data
+                    json=data if first else None
                 )['value']
             # 403 will be returned when approval is required or pending or access is denied
             except exceptions.ForbiddenRequest as e:
                 if 'PE-0011' in str(e) and not justification:
-                    raise exceptions.ApprovalRequiredButNoJustificationProvided()
+                    if first:
+                        raise exceptions.ApprovalRequiredButNoJustificationProvided()
+                    else:
+                        raise exceptions.ApprovalWorkflowRejected()
                 if 'PE-0002' in str(e):
                     raise exceptions.AccessDenied()
                 if 'PE-0010' in str(e):  # approval to view the secret is pending...
+                    first = False
                     time.sleep(wait_time)
                 else:
                     raise e

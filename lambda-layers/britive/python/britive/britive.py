@@ -1,11 +1,15 @@
 import os
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import json as native_json
 import pkg_resources
+import socket
+from .helpers import methods as helper_methods
+from .helpers import federation_providers as fp
 from .users import Users
 from .service_identity_tokens import ServiceIdentityTokens
 from .service_identities import ServiceIdentities
-from .exceptions import TenantMissingError, TokenMissingError, RootEnvironmentGroupNotFound, allowed_exceptions
+from .exceptions import *
 from .tags import Tags
 from .applications import Applications
 from .environments import Environments
@@ -27,8 +31,11 @@ from .identity_providers import IdentityProviders
 from .my_access import MyAccess
 from .notifications import Notifications
 from .my_secrets import MySecrets
-from .policies import  Policies
-
+from .policies import Policies
+from .secrets_manager import SecretsManager
+from .notification_mediums import NotificationMediums
+from .workload import Workload
+from .system.system import System
 
 BRITIVE_TENANT_ENV_NAME = 'BRITIVE_TENANT'
 BRITIVE_TOKEN_ENV_NAME = 'BRITIVE_API_TOKEN'
@@ -69,7 +76,8 @@ class Britive:
     must persist responses to disk if and when that is required.
     """
 
-    def __init__(self, tenant: str = None, token: str = None, query_features: bool = True):
+    def __init__(self, tenant: str = None, token: str = None, query_features: bool = True,
+                 token_federation_provider: str = None, token_federation_provider_duration_seconds: int = 900):
         """
         Instantiate an authenticated interface that can be used to communicate with the Britive API.
 
@@ -81,11 +89,22 @@ class Britive:
             vs v2, secrets manager enabled,etc.). True by default but can be disabled as needed if the end user does not
             want to wait for that API call. Querying for features will help instruct the SDK as to what API calls are
             allowed to be used based on the features enabled, vs. attempting to make the API call and getting an error.
+        :param token_federation_provider: The federation provider to use to source the token. Details of what can be
+            provided can be found in the documentation for the Britive.source_federation_token_from method.
+        :param token_federation_provider_duration_seconds: Only applicable for the AWS provider. Specify the number of
+            seconds for which the generated token is valid. Defaults to 900 seconds (15 minutes).
         :raises: TenantMissingError, TokenMissingError
         """
 
         self.tenant = tenant or os.environ.get(BRITIVE_TENANT_ENV_NAME)
-        self.__token = token or os.environ.get(BRITIVE_TOKEN_ENV_NAME)
+
+        if token_federation_provider:
+            self.__token = self.source_federation_token_from(
+                provider=token_federation_provider,
+                duration_seconds=token_federation_provider_duration_seconds
+            )
+        else:
+            self.__token = token or os.environ.get(BRITIVE_TOKEN_ENV_NAME)
 
         if not self.tenant:
             raise TenantMissingError(
@@ -99,10 +118,28 @@ class Britive:
                 f'from environment variable {BRITIVE_TOKEN_ENV_NAME}'
             )
 
-        self.base_url = f'https://{self.tenant}.britive-app.com/api'
+        # clean up and apply logic to the passed in tenant (for backwards compatibility with no domain being required)
+        self.tenant = self.parse_tenant(self.tenant)
+
+        self.base_url = f'https://{self.tenant}/api'
         self.session = requests.Session()
+        retries = Retry(total=5, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount('https://', HTTPAdapter(max_retries=retries))
+
+        # allow the disabling of TLS/SSL verification for testing in development (mostly local development)
+        if os.getenv('BRITIVE_NO_VERIFY_SSL') and '.dev.' in self.tenant:
+            # turn off ssl verification
+            self.session.verify = False
+            # wipe these due to this bug: https://github.com/psf/requests/issues/3829
+            os.environ['CURL_CA_BUNDLE'] = ""
+            os.environ['REQUESTS_CA_BUNDLE'] = ""
+            # disable the warning message
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         token_type = 'TOKEN' if len(self.__token) < 50 else 'Bearer'
+        if len(self.__token.split('::')) > 1:
+            token_type = 'WorkloadToken'
 
         try:
             version = pkg_resources.get_distribution('britive').version
@@ -142,6 +179,119 @@ class Britive:
         self.notifications = Notifications(self)
         self.my_secrets = MySecrets(self)
         self.policies = Policies(self)
+        self.secrets_manager = SecretsManager(self)
+        self.notification_mediums = NotificationMediums(self)
+        self.workload = Workload(self)
+        self.system = System(self)
+
+    @staticmethod
+    def source_federation_token_from(provider: str, tenant: str = None, duration_seconds: int = 900) -> str:
+        """
+        Returns a token from the specified federation provider.
+
+        The caller must persist this token if required. New tokens can be generated on each invocation
+        of this class as well.
+
+        This method only works when running with the context of the specified provider.
+        It is meant to abstract away the complexities of obtaining a federation token
+        from common federation providers. Other provider federation tokens can still be
+        sourced outside of this SDK and provided as input via the standard token presentation
+        options.
+
+        Five federation providers are currently supported by this method.
+
+        * AWS IAM/STS, with optional profile specified - (aws)
+        * Github Actions (github)
+        * Bitbucket Pipelines (bitbucket)
+        * Azure System Assigned Managed Identities (azuresmi)
+        * Azure User Assigned Managed Identities (azureumi)
+
+        Any other OIDC federation provider can be used and tokens can be provided to this class for authentication
+        to a Britive tenant. Details of how to construct these tokens can be found at https://docs.britive.com.
+
+        :param provider: The name of the federation provider. Valid options are `aws`, `github`, `bitbucket`,
+            `azuresmi`, and `azureumi`.
+
+            For the AWS provider it is possible to provide a profile via value `aws-profile`. If no profile is provided
+            then the boto3 `Session.get_credentials()` method will be used to obtain AWS credentials, which follows
+            the order provided here:
+            https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html#configuring-credentials
+
+            For the Github provider it is possible to provide an OIDC audience value via `github-<audience>`. If no
+            audience is provided the default Github audience value will be used.
+
+            For Azure User Assigned Managed Identities (azureumi) a client id is required. It must be
+            provided in the form `azureumi-<client-id>`. From the Azure documentation...a user-assigned identity's
+            client ID or, when using Pod Identity, the client ID of an Azure AD app registration. This argument
+            is supported in all hosting environments.
+
+            For both Azure Managed Identity options it is possible to provide an OIDC audience value via
+            `azuresmi-<audience>` and `azureumi-<client-id>|<audience>`. If no audience is provided the default audience
+             of `https://management.azure.com/` will be used.
+
+        :param tenant: The name of the tenant. This field is optional but if not provided then the tenant will be
+            sourced from environment variable BRITIVE_TENANT. Knowing the actual tenant is required for the AWS
+            federation provider. This field can be ignored for non AWS federation providers.
+        :param duration_seconds: Only applicable for the AWS provider. Specify the number of seconds for which the
+            generated token is valid. Defaults to 900 seconds (15 minutes).
+        :return: A federation token that can be used to authenticate to a Britive tenant.
+        """
+
+        helper = provider.split('-', maxsplit=1)
+        provider = helper[0]
+
+        if provider == 'aws':
+            profile = helper_methods.safe_list_get(helper, 1, None)
+            return fp.AwsFederationProvider(
+                profile=profile,
+                tenant=tenant,
+                duration=duration_seconds
+            ).get_token()
+
+        if provider == 'github':
+            audience = helper_methods.safe_list_get(helper, 1, None)
+            return fp.GithubFederationProvider(audience=audience).get_token()
+
+        if provider == 'bitbucket':
+            return fp.BitbucketFederationProvider().get_token()
+
+        if provider == 'azuresmi':
+            audience = helper_methods.safe_list_get(helper, 1, None)
+            return fp.AzureSystemAssignedManagedIdentityFederationProvider(audience=audience).get_token()
+
+        if provider == 'azureumi':
+            additional_attributes_str = helper_methods.safe_list_get(helper, 1, None)
+            if not additional_attributes_str:
+                raise ValueError('client id is required via azurumi-<client-id>')
+            additional_attributes = additional_attributes_str.split('|')
+            client_id = additional_attributes[0]
+            audience = helper_methods.safe_list_get(additional_attributes, 1, None)
+            return fp.AzureUserAssignedManagedIdentityFederationProvider(
+                client_id=client_id,
+                audience=audience
+            ).get_token()
+
+        raise InvalidFederationProvider(f'federation provider {provider} not supported')
+
+    @staticmethod
+    def parse_tenant(tenant: str) -> str:
+        domain = tenant.replace('https://', '').replace('http://', '')   # remove scheme
+        domain = domain.split('/')[0]  # remove any paths as they will not be needed
+        try:
+            domain_helper = domain.split(':')
+            port = 443
+            if len(domain_helper) > 1:
+                port = domain_helper[1]
+            domain_without_port = domain_helper[0]
+            socket.getaddrinfo(host=domain_without_port, port=port)  # if success then a full domain was provided
+            return domain
+        except socket.gaierror:  # assume just the tenant name was provided (originally the only supported method)
+            domain = f'{tenant}.britive-app.com'
+            try:
+                socket.getaddrinfo(host=domain, port=443)  # validate the hostname is real
+                return domain  # and if so set the tenant accordingly
+            except socket.gaierror:
+                raise Exception(f'Invalid tenant provided: {tenant}. DNS resolution failed.')
 
     def features(self):
         features = {}
@@ -184,6 +334,15 @@ class Britive:
             filename: (f'{filename}.xml', file_content_as_str, content_type)
         }
         response = self.session.patch(url, files=files, headers={'Content-Type': None})
+        try:
+            return response.json()
+        except native_json.decoder.JSONDecodeError:  # if we cannot decode json then the response isn't json
+            return response.content.decode('utf-8')
+    
+    # note - this method is only used to upload a file when creating a secret
+    def post_upload(self, url, params=None, files=None):
+        """Internal use only."""
+        response = self.session.post(url, params=params, files=files, headers={'Content-Type': None})
         try:
             return response.json()
         except native_json.decoder.JSONDecodeError:  # if we cannot decode json then the response isn't json
@@ -252,7 +411,7 @@ class Britive:
             # load the result as a dict
             try:
                 result = response.json()
-            except native_json.decoder.JSONDecodeError:  # if we cannot decode json then the response isn't json
+            except ValueError:  # includes simplejson.decoder.JSONDecodeError and native_json.decoder.JSONDecodeError
                 return response.content.decode('utf-8')
 
             # check on the pagination and iterate if required - we only need to check on this after the first
@@ -273,17 +432,17 @@ class Britive:
                 else:  # else loop again after incrementing the page number by 1
                     params['page'] = page + 1
             elif pagination_type == 'audit':
-                if 'next-page' not in response.headers.keys():
-                    break
-                url = response.headers['next-page']
-                params = {}  # the next-page header has all the URL parameters we need so unset them here
                 return_data += result  # result is already a list
-            elif pagination_type == 'report':
                 if 'next-page' not in response.headers.keys():
                     break
                 url = response.headers['next-page']
                 params = {}  # the next-page header has all the URL parameters we need so unset them here
+            elif pagination_type == 'report':
                 return_data += result['data']
+                if 'next-page' not in response.headers.keys():
+                    break
+                url = response.headers['next-page']
+                params = {}  # the next-page header has all the URL parameters we need so unset them here
             elif pagination_type == 'secmgr':
                 return_data += result['result']
                 next_page = result['pagination'].get('next', '')
